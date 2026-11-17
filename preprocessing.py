@@ -10,8 +10,8 @@ from typing import Tuple, Dict, Optional, List
 
 class TranscriptomicsDataset(Dataset):
     """
-    Dataset lưu trữ đồng thời biểu hiện gen đã chuẩn hóa (.data) cho Encoder,
-    ma trận đếm thô (.raw_counts) và kích thước thư viện (.library_size) cho ZINB Decoder,
+    Dataset lưu trữ biểu hiện gen đã chuẩn hóa Z-score theo miền (.data),
+    ma trận log-normalized (.raw_counts / log_expr), kích thước thư viện (.library_size),
     nhãn loại tế bào (.labels) và tọa độ không gian (.coords).
     """
     def __init__(
@@ -57,18 +57,12 @@ class TranscriptomicsDataset(Dataset):
 
 
 def _to_dense_array(matrix) -> np.ndarray:
-    """Chuyển ma trận thưa (sparse) hoặc DataFrame về numpy.ndarray 2D dạng float32."""
     if sp.issparse(matrix):
         return matrix.toarray().astype(np.float32)
     return np.asarray(matrix, dtype=np.float32)
 
 
 def _extract_raw_counts(adata: ad.AnnData) -> np.ndarray:
-    """
-    Trích xuất ma trận đếm thô (raw counts) để phục vụ nhánh giải mã ZINB.
-    Ưu tiên lấy từ .layers['counts'] hoặc .raw nếu có; nếu dữ liệu đã log-normalize
-    sẵn thì khôi phục xấp xỉ bằng hàm expm1.
-    """
     if "counts" in adata.layers:
         mat = _to_dense_array(adata.layers["counts"])
     elif adata.raw is not None and adata.raw.shape[1] == adata.shape[1]:
@@ -79,7 +73,6 @@ def _extract_raw_counts(adata: ad.AnnData) -> np.ndarray:
     mat = np.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
     mat = np.clip(mat, a_min=0.0, a_max=None)
 
-    # Nếu giá trị lớn nhất quá nhỏ (< 50) và có số thực lẻ, khả năng cao dữ liệu đã bị log1p
     if mat.max() < 30.0 and not np.allclose(mat, np.round(mat), atol=1e-2):
         mat = np.expm1(mat)
 
@@ -87,7 +80,6 @@ def _extract_raw_counts(adata: ad.AnnData) -> np.ndarray:
 
 
 def _extract_spatial_coords(adata_spa: ad.AnnData) -> np.ndarray:
-    """Trích xuất tọa độ không gian 2D từ obsm['spatial'] hoặc các cột tọa độ trong obs."""
     if "spatial" in adata_spa.obsm:
         coords = np.asarray(adata_spa.obsm["spatial"], dtype=np.float32)[:, :2]
     elif "X_spatial" in adata_spa.obsm:
@@ -103,7 +95,6 @@ def _extract_spatial_coords(adata_spa: ad.AnnData) -> np.ndarray:
         else:
             coords = np.zeros((adata_spa.n_obs, 2), dtype=np.float32)
 
-    # Chuẩn hóa tọa độ về [0, 1] để khoảng cách không gian nhất quán giữa các công nghệ ST
     if coords.shape[0] > 0:
         c_min = coords.min(axis=0, keepdims=True)
         c_max = coords.max(axis=0, keepdims=True)
@@ -112,29 +103,32 @@ def _extract_spatial_coords(adata_spa: ad.AnnData) -> np.ndarray:
     return coords
 
 
-def _normalize_and_scale(raw_counts: np.ndarray, target_sum: float = 1e4) -> Tuple[np.ndarray, np.ndarray]:
+def _normalize_and_domain_standardize(
+    raw_counts: np.ndarray, target_sum: float = 1e4
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Thực hiện chuẩn hóa theo đúng pipeline:
-    1) Tính library size l_n = log(sum_g x_{ng} + eps)
-    2) Library-size normalize về target_sum (10^4)
-    3) Log-transform: x'' = ln(x' + 1)
-    4) Batch-scale mỗi tế bào theo giá trị tuyệt đối cực đại trong miền dữ liệu.
+    Chuẩn hóa khử lệch miền (Domain-Specific Gene Standardization):
+    1) Chuẩn hóa tổng đếm mỗi tế bào về target_sum (10^4) và biến đổi log1p.
+    2) Chuẩn hóa Z-score (mean=0, std=1) theo từng gen trong nội bộ mỗi miền để
+       khử sự khác biệt về độ nhạy đầu dò giữa scRNA-seq và ST (seqFISH/Visium).
+    3) Chuẩn hóa L2 theo từng tế bào hoặc cắt ngưỡng [-5, 5] để ổn định gradient.
     """
     cell_sums = raw_counts.sum(axis=1, keepdims=True)
     log_lib_size = np.log(np.clip(cell_sums.squeeze(-1), a_min=1.0, a_max=None)).astype(np.float32)
 
     safe_sums = np.where(cell_sums > 0, cell_sums, 1.0)
     norm_counts = (raw_counts / safe_sums) * target_sum
-    log_data = np.log1p(norm_counts)
+    log_data = np.log1p(norm_counts).astype(np.float32)
 
-    # Batch scaling theo cực đại của từng gen/mẫu giúp ổn định đầu vào cho DSBN
-    max_val = np.max(np.abs(log_data))
-    if max_val > 1e-8:
-        scaled_data = (log_data / max_val).astype(np.float32)
-    else:
-        scaled_data = log_data.astype(np.float32)
+    # Chuẩn hóa Z-score theo từng gen trong miền hiện tại
+    gene_mean = log_data.mean(axis=0, keepdims=True)
+    gene_std = log_data.std(axis=0, keepdims=True)
+    gene_std = np.where(gene_std > 1e-6, gene_std, 1.0)
 
-    return scaled_data, log_lib_size
+    z_data = (log_data - gene_mean) / gene_std
+    z_data = np.clip(z_data, a_min=-5.0, a_max=5.0).astype(np.float32)
+
+    return z_data, log_data, log_lib_size
 
 
 def preprocess_pipeline(
@@ -146,20 +140,12 @@ def preprocess_pipeline(
     target_sum: float = 1e4,
     num_workers: int = 0,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
-    """
-    Tiền xử lý cặp dữ liệu tham chiếu scRNA-seq và dữ liệu truy vấn Spatial Transcriptomics.
-
-    Trả về:
-        dl_rna: DataLoader cho tập tham chiếu scRNA-seq (shuffle=True)
-        dl_spa: DataLoader cho tập không gian ST (shuffle=False để giữ thứ tự đánh giá)
-        label_mapping: Dict ánh xạ tên loại tế bào (str) -> chỉ số nguyên (0 .. C-1)
-    """
     rna = adata_rna.copy()
     spa = adata_spa.copy()
     rna.var_names_make_unique()
     spa.var_names_make_unique()
 
-    # 1. Tìm tập gen giao nhau giữa scRNA-seq và Spatial
+    # 1. Lấy tập gen chung giữa scRNA-seq và ST
     common_genes = np.intersect1d(rna.var_names.values, spa.var_names.values)
     if len(common_genes) == 0:
         raise ValueError("Không tìm thấy gen chung nào giữa adata_rna và adata_spa!")
@@ -167,11 +153,9 @@ def preprocess_pipeline(
     rna = rna[:, common_genes].copy()
     spa = spa[:, common_genes].copy()
 
-    # 2. Lưu trữ ma trận đếm thô trước khi lọc HVG
     rna_raw_all = _extract_raw_counts(rna)
     spa_raw_all = _extract_raw_counts(spa)
 
-    # Loại bỏ các gen có tổng biểu hiện bằng 0 ở cả hai miền
     non_zero_mask = (rna_raw_all.sum(axis=0) > 0) & (spa_raw_all.sum(axis=0) > 0)
     if non_zero_mask.sum() > 0:
         rna = rna[:, non_zero_mask].copy()
@@ -179,7 +163,7 @@ def preprocess_pipeline(
         rna_raw_all = rna_raw_all[:, non_zero_mask]
         spa_raw_all = spa_raw_all[:, non_zero_mask]
 
-    # 3. Chọn n_top_genes Highly Variable Genes (nếu số gen chung lớn hơn n_top_genes)
+    # 2. Lọc Highly Variable Genes nếu số gen chung > n_top_genes
     if n_top_genes is not None and rna.n_vars > n_top_genes:
         rna_temp = ad.AnnData(X=rna_raw_all.copy())
         rna_temp.var_names = rna.var_names.copy()
@@ -207,11 +191,11 @@ def preprocess_pipeline(
         rna_raw = rna_raw_all
         spa_raw = spa_raw_all
 
-    # 4. Chuẩn hóa biểu hiện gen và tính kích thước thư viện
-    rna_norm, rna_lib = _normalize_and_scale(rna_raw, target_sum=target_sum)
-    spa_norm, spa_lib = _normalize_and_scale(spa_raw, target_sum=target_sum)
+    # 3. Chuẩn hóa Z-score theo từng gen trên mỗi miền
+    rna_z, rna_log, rna_lib = _normalize_and_domain_standardize(rna_raw, target_sum=target_sum)
+    spa_z, spa_log, spa_lib = _normalize_and_domain_standardize(spa_raw, target_sum=target_sum)
 
-    # 5. Mã hóa nhãn loại tế bào trên tập tham chiếu scRNA-seq
+    # 4. Mã hóa nhãn
     if label_col not in rna.obs.columns:
         raise KeyError(f"Cột nhãn '{label_col}' không tồn tại trong adata_rna.obs!")
 
@@ -222,8 +206,6 @@ def preprocess_pipeline(
     rna_labels = np.array([label_mapping[name] for name in rna_labels_str], dtype=np.int64)
     class_counts = np.bincount(rna_labels, minlength=len(label_mapping)).astype(np.float32)
 
-    # 6. Mã hóa nhãn cho tập Spatial (nếu có ground-truth):
-    # Các loại tế bào nằm trong tập tham chiếu nhận ID 0..C-1; tế bào "Unknown" nhận ID -1
     if label_col in spa.obs.columns:
         spa_labels_str = spa.obs[label_col].astype(str).values
         spa_labels = np.array(
@@ -232,14 +214,13 @@ def preprocess_pipeline(
     else:
         spa_labels = np.full(spa.n_obs, -1, dtype=np.int64)
 
-    # 7. Trích xuất tọa độ không gian
     spa_coords = _extract_spatial_coords(spa)
     rna_coords = np.zeros((rna.n_obs, 2), dtype=np.float32)
 
-    # 8. Khởi tạo Dataset & DataLoader
+    # Lưu rna_z vào .data và rna_z vào .raw_counts để Decoder tái tạo đồng nhất không gian chuẩn hóa
     ds_rna = TranscriptomicsDataset(
-        norm_data=rna_norm,
-        raw_counts=rna_raw,
+        norm_data=rna_z,
+        raw_counts=rna_log,
         library_size=rna_lib,
         labels=rna_labels,
         coords=rna_coords,
@@ -247,8 +228,8 @@ def preprocess_pipeline(
         class_counts=class_counts,
     )
     ds_spa = TranscriptomicsDataset(
-        norm_data=spa_norm,
-        raw_counts=spa_raw,
+        norm_data=spa_z,
+        raw_counts=spa_log,
         library_size=spa_lib,
         labels=spa_labels,
         coords=spa_coords,
