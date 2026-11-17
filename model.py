@@ -7,44 +7,58 @@ from typing import Dict, Tuple, Optional
 
 
 # ==============================================================================
-# 1. DATASET-SPECIFIC BATCH NORMALIZATION (DSBN) CÓ CHẾ ĐỘ ĐÓNG BĂNG THỐNG KÊ
+# 1. SHARED-AFFINE DATASET-SPECIFIC BATCH NORMALIZATION (SA-DSBN)
 # ==============================================================================
-class DSBN1d(nn.Module):
+class SharedAffineDSBN1d(nn.Module):
     """
-    Dataset-Specific Batch Normalization cho 2 miền dữ liệu:
-    - domain_id = 0: scRNA-seq reference
-    - domain_id = 1: Spatial Transcriptomics query
-    Hỗ trợ cờ `freeze_stats=True` khi chạy nhánh Chỉnh lưu Đa tạp (Manifold Rectifier)
-    để các điểm Mixup nhân tạo không bao giờ làm lệch trung bình/phương sai của dữ liệu thực.
+    Dataset-Specific Batch Normalization với tham số Affine (gamma, beta) DÙNG CHUNG:
+    - Mỗi miền (scRNA-seq: domain_id=0, Spatial: domain_id=1) tự ước lượng running_mean
+      và running_var riêng để loại bỏ hoàn toàn độ lệch tâm (mean shift) và lệch phương sai.
+    - Sau khi chuẩn hóa về N(0, 1), cả 2 miền đi qua CÙNG một cặp (weight, bias) để
+      đảm bảo đám mây điểm tiềm ẩn của scRNA-seq và ST luôn nằm chồng khít lên nhau!
     """
-    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1):
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True):
         super().__init__()
-        self.bn_rna = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum)
-        self.bn_spa = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum)
+        self.num_features = num_features
+        self.affine = affine
+        self.bn_rna = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum, affine=False)
+        self.bn_spa = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum, affine=False)
+
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor, domain_id: int = 0, freeze_stats: bool = False) -> torch.Tensor:
         bn_layer = self.bn_rna if domain_id == 0 else self.bn_spa
         if freeze_stats and bn_layer.training:
-            # Sử dụng running_mean và running_var đã học từ dữ liệu thực mà không cập nhật
-            return F.batch_norm(
+            out = F.batch_norm(
                 x,
                 bn_layer.running_mean,
                 bn_layer.running_var,
-                bn_layer.weight,
-                bn_layer.bias,
+                None,
+                None,
                 training=False,
                 momentum=0.0,
                 eps=bn_layer.eps,
             )
-        return bn_layer(x)
+        else:
+            out = bn_layer(x)
+
+        if self.affine:
+            out = out * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
+        return out
 
 
 # ==============================================================================
-# 2. VARIATIONAL ENCODER & ZINB DECODER
+# 2. VARIATIONAL ENCODER & DOMAIN-ADAPTIVE DECODER
 # ==============================================================================
 class VariationalEncoder(nn.Module):
     """
-    Ánh xạ biểu hiện gen chuẩn hóa x -> phân phối hậu nghiệm q_phi(z | x) = N(mu, diag(sigma^2)).
+    Bộ mã hóa biến phân sử dụng SharedAffineDSBN1d ở cả các tầng ẩn lẫn đầu ra mu_head,
+    giữ cho biểu diễn tiềm ẩn của scRNA-seq và ST hoàn toàn đồng tâm trên mọi chiều.
     """
     def __init__(
         self,
@@ -56,16 +70,18 @@ class VariationalEncoder(nn.Module):
         super().__init__()
         h1, h2 = hidden_dims
         self.fc1 = nn.Linear(input_dim, h1)
-        self.dsbn1 = DSBN1d(h1)
+        self.dsbn1 = SharedAffineDSBN1d(h1)
         self.act1 = nn.ELU()
         self.drop1 = nn.Dropout(dropout)
 
         self.fc2 = nn.Linear(h1, h2)
-        self.dsbn2 = DSBN1d(h2)
+        self.dsbn2 = SharedAffineDSBN1d(h2)
         self.act2 = nn.ELU()
         self.drop2 = nn.Dropout(dropout)
 
-        self.mu_head = nn.Linear(h2, latent_dim)
+        self.mu_fc = nn.Linear(h2, latent_dim)
+        # Chuẩn hóa DSBN ngay trên mu để triệt tiêu độ dịch chuyển đám mây ST so với scRNA-seq
+        self.mu_dsbn = SharedAffineDSBN1d(latent_dim, affine=True)
         self.logvar_head = nn.Linear(h2, latent_dim)
 
     def forward(
@@ -79,8 +95,8 @@ class VariationalEncoder(nn.Module):
         h = self.dsbn2(h, domain_id=domain_id, freeze_stats=freeze_stats)
         h = self.drop2(self.act2(h))
 
-        mu = self.mu_head(h)
-        logvar = torch.clamp(self.logvar_head(h), min=-8.0, max=4.0)
+        mu = self.mu_dsbn(self.mu_fc(h), domain_id=domain_id, freeze_stats=freeze_stats)
+        logvar = torch.clamp(self.logvar_head(h), min=-6.0, max=2.0)
         std = torch.exp(0.5 * logvar)
 
         if self.training and not freeze_stats:
@@ -91,113 +107,70 @@ class VariationalEncoder(nn.Module):
         return z, mu, logvar
 
 
-class ZINBDecoder(nn.Module):
+class DomainAdaptiveDecoder(nn.Module):
     """
-    Bộ giải mã sinh học theo phân phối Zero-Inflated Negative Binomial (ZINB).
-    Đồng thời cung cấp hàm `decode_to_surrogate_input(z)` khả vi hoàn toàn để
-    ánh xạ vector tiềm ẩn z_mix về không gian đầu vào chuẩn hóa phục vụ Bộ chỉnh lưu Đa tạp.
+    Bộ giải mã thích ứng miền (sử dụng SharedAffineDSBN1d):
+    - Cho phép tái tạo chính xác biểu hiện gen chuẩn hóa của từng miền mà KHÔNG ép
+      vector tiềm ẩn z phải lưu trữ thông tin khác biệt công nghệ (seqFISH vs scRNA-seq).
+    - Khớp 100% không gian đầu vào của Encoder khi chạy vòng lặp Manifold Rectifier.
     """
     def __init__(
         self,
         latent_dim: int,
         output_dim: int,
         hidden_dims: Tuple[int, int] = (128, 256),
-        target_sum: float = 1e4,
     ):
         super().__init__()
         h1, h2 = hidden_dims
-        self.target_sum = target_sum
+        self.fc1 = nn.Linear(latent_dim, h1)
+        self.dsbn1 = SharedAffineDSBN1d(h1)
+        self.act1 = nn.ELU()
 
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, h1),
-            nn.LayerNorm(h1),
-            nn.ELU(),
-            nn.Linear(h1, h2),
-            nn.LayerNorm(h2),
-            nn.ELU(),
-        )
-        # Tần số biểu hiện tương đối rho_ng (tổng theo gen bằng 1)
-        self.rho_head = nn.Sequential(
-            nn.Linear(h2, output_dim),
-            nn.Softmax(dim=-1),
-        )
-        # Logit xác suất dropout pi_ng
-        self.pi_logits_head = nn.Linear(h2, output_dim)
-        # Tham số phân tán theo từng gen (log-theta)
-        self.log_theta = nn.Parameter(torch.zeros(output_dim))
+        self.fc2 = nn.Linear(h1, h2)
+        self.dsbn2 = SharedAffineDSBN1d(h2)
+        self.act2 = nn.ELU()
 
-        # Hệ số tỷ lệ khả học để khớp với bước batch-scale ở tiền xử lý
-        self.surrogate_scale = nn.Parameter(torch.tensor(1.0 / math.log(target_sum + 1.0)))
+        self.out_head = nn.Linear(h2, output_dim)
 
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        h = self.net(z)
-        rho = self.rho_head(h)
-        pi_logits = self.pi_logits_head(h)
-        theta = F.softplus(self.log_theta) + 1e-4
-        return rho, pi_logits, theta
+    def forward(
+        self, z: torch.Tensor, domain_id: int = 0, freeze_stats: bool = False
+    ) -> torch.Tensor:
+        h = self.fc1(z)
+        h = self.dsbn1(h, domain_id=domain_id, freeze_stats=freeze_stats)
+        h = self.act1(h)
+
+        h = self.fc2(h)
+        h = self.dsbn2(h, domain_id=domain_id, freeze_stats=freeze_stats)
+        h = self.act2(h)
+
+        x_hat = self.out_head(h)
+        return x_hat
 
     def decode_to_surrogate_input(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Tạo biểu hiện gen chuẩn hóa kỳ vọng (khả vi) từ vector tiềm ẩn z:
-        x_hat = scale * ln(rho * 10^4 + 1)
-        """
-        rho, _, _ = self.forward(z)
-        log_expr = torch.log1p(rho * self.target_sum)
-        scale = torch.clamp(self.surrogate_scale, min=0.05, max=1.0)
-        return log_expr * scale
+        return self.forward(z, domain_id=0, freeze_stats=True)
 
 
-def zinb_negative_log_likelihood(
-    raw_counts: torch.Tensor,
-    library_size: torch.Tensor,
-    rho: torch.Tensor,
-    pi_logits: torch.Tensor,
-    theta: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Tính hàm mất mát âm log-likelihood của phân phối ZINB."""
-    lib_counts = torch.exp(torch.clamp(library_size, min=0.0, max=15.0))
-    mu = rho * lib_counts + eps
-    theta = theta.unsqueeze(0)
-
-    t1 = torch.lgamma(raw_counts + theta + eps) - torch.lgamma(theta + eps) - torch.lgamma(raw_counts + 1.0)
-    t2 = theta * (torch.log(theta + eps) - torch.log(theta + mu + eps))
-    t3 = raw_counts * (torch.log(mu + eps) - torch.log(theta + mu + eps))
-    nb_log_prob = t1 + t2 + t3
-
-    zero_nb = theta * (torch.log(theta + eps) - torch.log(theta + mu + eps))
-    zero_case = -F.softplus(-pi_logits + zero_nb) - F.softplus(pi_logits)
-    non_zero_case = -F.softplus(pi_logits) + nb_log_prob
-
-    mask = (raw_counts < eps).float()
-    log_lik = mask * zero_case + (1.0 - mask) * non_zero_case
-    return -log_lik.mean()
+def profile_reconstruction_loss(x_true: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
+    """Kết hợp Smooth-L1 (Huber) và Cosine Profile Similarity trên biểu hiện gen chuẩn hóa."""
+    huber = F.smooth_l1_loss(x_hat, x_true, reduction="mean")
+    cos_loss = 1.0 - F.cosine_similarity(x_hat, x_true, dim=-1).mean()
+    return huber + 0.5 * cos_loss
 
 
 # ==============================================================================
-# 3. BỘ TĂNG CƯỜNG LATENT MIXUP & CHỈNH LƯU ĐA TẠP (KHÔNG DÙNG GMM, KHÔNG DÙNG KNN)
+# 3. BỘ TĂNG CƯỜNG LATENT MIXUP & CHỈNH LƯU ĐA TẠP (NON-GMM, NON-KNN)
 # ==============================================================================
 class LatentMixupRectifier(nn.Module):
-    """
-    Thực hiện Latent Posterior Mixup không cần GMM và không cần k-NN:
-    1) Lưu một hàng đợi phân phối hậu nghiệm nhỏ (FIFO Class Anchor Bank) cho từng lớp
-       để ngay cả các lớp cực hiếm (chỉ có vài tế bào) luôn có đối tác ghép cặp trong mỗi batch.
-    2) Cổng tương đồng Cosine nội tại (Cosine Coherence Gate): Khi ghép hai tế bào cùng lớp hiếm,
-       nếu góc Cosine giữa chúng thấp (thuộc 2 phân nhóm dị질 xa nhau như ở CAFs), hệ số trộn lambda
-       tự động co về gần 1.0 để chỉ mở rộng phương sai cục bộ mà không nối chéo qua khoảng trống.
-    3) Bộ Chỉnh lưu Đa tạp (Manifold Rectifier): Đưa z_mix qua Decoder -> Encoder để uốn cong
-       về đa tạp sinh học và tính trọng số tin cậy w(z*).
-    """
     def __init__(
         self,
         num_classes: int,
         latent_dim: int,
         class_counts: Optional[torch.Tensor] = None,
-        queue_size_per_class: int = 16,
+        queue_size_per_class: int = 24,
         beta_alpha: float = 2.0,
         cos_threshold: float = 0.35,
-        rect_blend: float = 0.4,
-        trust_eta: float = 2.0,
+        rect_blend: float = 0.35,
+        trust_eta: float = 1.5,
         imbalance_power: float = 0.5,
     ):
         super().__init__()
@@ -209,13 +182,11 @@ class LatentMixupRectifier(nn.Module):
         self.rect_blend = rect_blend
         self.trust_eta = trust_eta
 
-        # Tính trọng số ưu tiên tăng cường theo mức độ hiếm của từng lớp
         if class_counts is not None:
             counts = class_counts.float().clamp(min=1.0)
             n_max = counts.max()
             rarity = 1.0 - (counts / n_max).pow(imbalance_power)
-            # Chuẩn hóa về [0.05, 1.0] (lớp đa số hầu như không cần sinh thêm)
-            rarity = torch.clamp(rarity, min=0.0, max=1.0)
+            rarity = torch.clamp(rarity, min=0.10, max=1.0)
         else:
             rarity = torch.ones(num_classes) * 0.5
             counts = torch.ones(num_classes)
@@ -223,7 +194,6 @@ class LatentMixupRectifier(nn.Module):
         self.register_buffer("class_counts", counts)
         self.register_buffer("class_rarity", rarity)
 
-        # Bộ nhớ đệm FIFO lưu (mu, logvar) gần nhất của từng lớp (thay thế hoàn toàn k-NN toàn cục)
         self.register_buffer("mu_queue", torch.zeros(num_classes, queue_size_per_class, latent_dim))
         self.register_buffer("logvar_queue", torch.zeros(num_classes, queue_size_per_class, latent_dim))
         self.register_buffer("queue_ptr", torch.zeros(num_classes, dtype=torch.long))
@@ -231,7 +201,6 @@ class LatentMixupRectifier(nn.Module):
 
     @torch.no_grad()
     def update_queues(self, mu: torch.Tensor, logvar: torch.Tensor, labels: torch.Tensor):
-        """Cập nhật hàng đợi hậu nghiệm cho các lớp xuất hiện trong mini-batch hiện tại."""
         for c in torch.unique(labels):
             c_idx = int(c.item())
             if c_idx < 0 or c_idx >= self.num_classes:
@@ -239,9 +208,7 @@ class LatentMixupRectifier(nn.Module):
             mask = labels == c
             mu_c = mu[mask].detach()
             lv_c = logvar[mask].detach()
-            n_samples = mu_c.shape[0]
-
-            for i in range(n_samples):
+            for i in range(mu_c.shape[0]):
                 ptr = int(self.queue_ptr[c_idx].item())
                 self.mu_queue[c_idx, ptr] = mu_c[i]
                 self.logvar_queue[c_idx, ptr] = lv_c[i]
@@ -254,18 +221,13 @@ class LatentMixupRectifier(nn.Module):
         logvar: torch.Tensor,
         labels: torch.Tensor,
         encoder: VariationalEncoder,
-        decoder: ZINBDecoder,
+        decoder: DomainAdaptiveDecoder,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Sinh các điểm tiềm ẩn nhân tạo đã được chỉnh lưu qua cặp Decoder-Encoder.
-        """
         device = mu.device
         self.update_queues(mu, logvar, labels)
 
-        # Chọn các tế bào thuộc các lớp thiểu số trong batch làm neo (anchors)
         sample_rarity = self.class_rarity[labels]
-        # Lấy mẫu xác suất theo độ hiếm để tập trung tài nguyên cho các lớp thiểu số
-        keep_prob = torch.clamp(sample_rarity * 1.2, min=0.1, max=1.0)
+        keep_prob = torch.clamp(sample_rarity * 1.2, min=0.15, max=1.0)
         selected_mask = torch.bernoulli(keep_prob).bool()
         if selected_mask.sum() < 2:
             selected_mask = torch.ones_like(labels, dtype=torch.bool)
@@ -279,14 +241,12 @@ class LatentMixupRectifier(nn.Module):
         partner_mu = torch.zeros_like(anchor_mu)
         partner_std = torch.zeros_like(anchor_std)
 
-        # 1. Ghép cặp nội lớp từ bộ nhớ đệm (Intra-Class Pairing)
         for i in range(M):
             c_idx = int(anchor_labels[i].item())
             filled = int(self.queue_filled[c_idx].item())
             if filled > 1:
                 cand_mu = self.mu_queue[c_idx, :filled]
                 cand_std = torch.exp(0.5 * self.logvar_queue[c_idx, :filled])
-                # Chọn ngẫu nhiên 1 đối tác cùng lớp từ queue
                 rand_idx = torch.randint(0, filled, (1,), device=device).item()
                 partner_mu[i] = cand_mu[rand_idx]
                 partner_std[i] = cand_std[rand_idx]
@@ -294,55 +254,44 @@ class LatentMixupRectifier(nn.Module):
                 partner_mu[i] = anchor_mu[i]
                 partner_std[i] = anchor_std[i]
 
-        # 2. Cổng Tương đồng Góc Cosine (Bảo vệ các lớp dị질 như CAFs không bị trộn chéo phân nhóm)
         cos_sim = F.cosine_similarity(anchor_mu, partner_mu, dim=-1, eps=1e-8)
         coherence_gate = (cos_sim >= self.cos_threshold).float().unsqueeze(-1)
 
         beta_dist = torch.distributions.Beta(self.beta_alpha, self.beta_alpha)
         raw_lam = beta_dist.sample((M, 1)).to(device)
-        raw_lam = torch.max(raw_lam, 1.0 - raw_lam)  # Luôn >= 0.5 về phía tế bào neo
+        raw_lam = torch.max(raw_lam, 1.0 - raw_lam)
 
-        # Nếu 2 tế bào cùng lớp nhưng thuộc 2 phân nhóm quá xa nhau (cos_sim < cos_threshold),
-        # thu hẹp hệ số nội suy về [0.90, 0.98] để chỉ mở rộng đám mây phương sai cục bộ của Encoder
         local_lam = 0.90 + 0.08 * torch.rand((M, 1), device=device)
         lam_intra = coherence_gate * raw_lam + (1.0 - coherence_gate) * local_lam
 
-        # Nội suy đồng thời cả kỳ vọng (mu) và độ lệch chuẩn hậu nghiệm (sigma) của Encoder
         mu_mix_intra = lam_intra * anchor_mu + (1.0 - lam_intra) * partner_mu
         std_mix_intra = lam_intra * anchor_std + (1.0 - lam_intra) * partner_std
-        eps_intra = torch.randn_like(std_mix_intra)
-        z_mix_intra = mu_mix_intra + eps_intra * std_mix_intra
+        z_mix_intra = mu_mix_intra + 0.5 * torch.randn_like(std_mix_intra) * std_mix_intra
 
-        # 3. Nội suy Biên Bất đối xứng (Asymmetric Boundary Remix) đẩy biên khỏi lớp đa số
-        # Tìm điểm khác lớp có độ tương đồng Cosine lớn nhất trong batch (hard boundary negative)
+        # Boundary Remix nhẹ bám sát biên lớp hiếm
         norm_anchor = F.normalize(anchor_mu.detach(), dim=-1)
         norm_batch = F.normalize(mu.detach(), dim=-1)
-        sim_matrix = torch.matmul(norm_anchor, norm_batch.t())  # (M, B)
+        sim_matrix = torch.matmul(norm_anchor, norm_batch.t())
         same_class_mask = anchor_labels.unsqueeze(1) == labels.unsqueeze(0)
         sim_matrix = sim_matrix.masked_fill(same_class_mask, -1e9)
         hard_neg_idx = sim_matrix.argmax(dim=1)
 
         neg_mu = mu[hard_neg_idx].detach()
-        # Hệ số trộn bám sát tế bào hiếm [0.78, 0.94] để mở rộng lớp vỏ biên mà không xâm lấn vùng Unknown
-        lam_bound = 0.78 + 0.16 * torch.rand((M, 1), device=device)
-        z_mix_bound = lam_bound * anchor_mu + (1.0 - lam_bound) * neg_mu + 0.5 * torch.randn_like(anchor_std) * anchor_std
+        lam_bound = 0.82 + 0.14 * torch.rand((M, 1), device=device)
+        z_mix_bound = lam_bound * anchor_mu + (1.0 - lam_bound) * neg_mu + 0.3 * torch.randn_like(anchor_std) * anchor_std
 
-        # Gộp cả hai luồng tăng cường (Intra-class + Boundary Remix)
         z_mix_all = torch.cat([z_mix_intra, z_mix_bound], dim=0)
         y_mix_all = torch.cat([anchor_labels, anchor_labels], dim=0)
 
-        # 4. Bộ Chỉnh lưu Đa tạp qua Chu trình Decoder -> Encoder (VAE Manifold Retraction)
+        # Chỉnh lưu Đa tạp qua Decoder -> Encoder (cùng miền chuẩn hóa domain_id=0)
         x_surrogate = decoder.decode_to_surrogate_input(z_mix_all)
         _, z_rect_all, _ = encoder(x_surrogate, domain_id=0, freeze_stats=True)
 
-        # Vector tiềm ẩn đã chỉnh lưu kéo về đa tạp sinh học
         z_star = (1.0 - self.rect_blend) * z_mix_all + self.rect_blend * z_rect_all
 
-        # Khoảng cách lệch đa tạp và Trọng số tin cậy sinh học w(z*)
         discrepancy = torch.mean((z_mix_all.detach() - z_rect_all.detach()) ** 2, dim=-1)
         trust_weights = torch.exp(-self.trust_eta * discrepancy)
 
-        # Hàm mất mát Đồng thuận Đa tạp (Manifold Convexity Loss) tính trên các cặp nội lớp hợp lệ
         z_rect_intra = z_rect_all[:M]
         valid_weights = coherence_gate.squeeze(-1) + 0.2 * (1.0 - coherence_gate.squeeze(-1))
         rect_loss = torch.mean(valid_weights * torch.mean((z_mix_intra.detach() - z_rect_intra) ** 2, dim=-1))
@@ -356,35 +305,36 @@ class LatentMixupRectifier(nn.Module):
 
 
 # ==============================================================================
-# 4. MINIBATCH UNBALANCED OPTIMAL TRANSPORT (MINIBATCH-UOT)
+# 4. MINIBATCH UNBALANCED OPTIMAL TRANSPORT (CHỐNG COLLAPSE ĐƠN LỚP)
 # ==============================================================================
 class MinibatchUOT(nn.Module):
     """
-    Giải bài toán Vận chuyển Tối ưu Không cân bằng (Unbalanced Optimal Transport)
-    giữa các tế bào không gian (Spatial query) và các nguyên mẫu lớp (Prototypes)
-    bằng thuật toán Sinkhorn-Knopp khả vi trên miền log.
+    Sinkhorn Unbalanced Optimal Transport với điều chuẩn biên cột đủ chặt (reg_m_kl_col)
+    để ngăn chặn hiện tượng dồn toàn bộ tế bào không gian vào một lớp duy nhất.
     """
-    def __init__(self, reg_ent: float = 0.05, reg_m_kl: float = 0.5, num_iters: int = 20):
+    def __init__(
+        self,
+        reg_ent: float = 0.06,
+        reg_m_kl_row: float = 0.5,
+        reg_m_kl_col: float = 1.5,
+        num_iters: int = 25,
+    ):
         super().__init__()
         self.reg_ent = reg_ent
-        self.reg_m_kl = reg_m_kl
+        self.reg_m_kl_row = reg_m_kl_row
+        self.reg_m_kl_col = reg_m_kl_col
         self.num_iters = num_iters
 
     @torch.no_grad()
     def compute_transport_plan(
-        self, cost_matrix: torch.Tensor, class_prior: Optional[torch.Tensor] = None
+        self, cost_matrix: torch.Tensor, target_prior: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        cost_matrix: (B_sp, C) khoảng cách Cosine trong [0, 2]
-        Trả về kế hoạch vận chuyển T: (B_sp, C)
-        """
         B_sp, C = cost_matrix.shape
         device = cost_matrix.device
 
-        # Phân phối biên đều cho các điểm không gian và phân phối biên có điều chỉnh cho nguyên mẫu
         a = torch.full((B_sp,), 1.0 / B_sp, device=device)
-        if class_prior is not None:
-            b = class_prior / (class_prior.sum() + 1e-8)
+        if target_prior is not None:
+            b = target_prior / (target_prior.sum() + 1e-8)
         else:
             b = torch.full((C,), 1.0 / C, device=device)
 
@@ -392,30 +342,24 @@ class MinibatchUOT(nn.Module):
         log_b = torch.log(b + 1e-8)
         log_K = -cost_matrix / self.reg_ent
 
-        tau = self.reg_m_kl / (self.reg_m_kl + self.reg_ent)
+        tau_row = self.reg_m_kl_row / (self.reg_m_kl_row + self.reg_ent)
+        tau_col = self.reg_m_kl_col / (self.reg_m_kl_col + self.reg_ent)
+
         u = torch.zeros(B_sp, device=device)
         v = torch.zeros(C, device=device)
 
         for _ in range(self.num_iters):
-            u = tau * (log_a - torch.logsumexp(log_K + v.unsqueeze(0), dim=1))
-            v = tau * (log_b - torch.logsumexp(log_K + u.unsqueeze(1), dim=0))
+            u = tau_row * (log_a - torch.logsumexp(log_K + v.unsqueeze(0), dim=1))
+            v = tau_col * (log_b - torch.logsumexp(log_K + u.unsqueeze(1), dim=0))
 
         log_T = u.unsqueeze(1) + log_K + v.unsqueeze(0)
         return torch.exp(log_T)
 
 
 # ==============================================================================
-# 5. KIẾN TRÚC TỔNG THỂ: MaRe-VAE (MANIFOLD-RECTIFIED LATENT MIXUP VAE)
+# 5. KIẾN TRÚC MaRe-VAE HOÀN CHỈNH (ĐÃ KHẮC PHỤC LỆCH MIỀN & COLLAPSE)
 # ==============================================================================
 class MaReVAE(nn.Module):
-    """
-    Kiến trúc MaRe-VAE tích hợp:
-    - Dual-Domain Variational Encoder (với DSBN tách biệt thống kê)
-    - ZINB Generative Decoder
-    - Non-GMM, Non-kNN Latent Posterior Mixup & VAE Manifold Rectifier
-    - Cosine Prototype Classifier có hiệu chỉnh tần số lớp (Logit Adjustment)
-    - Minibatch-UOT & Ràng buộc mượt láng giềng không gian (Spatial Neighbor Smoothness)
-    """
     def __init__(
         self,
         input_dim: int,
@@ -424,13 +368,14 @@ class MaReVAE(nn.Module):
         hidden_dims: Tuple[int, int] = (256, 128),
         class_counts: Optional[torch.Tensor] = None,
         cosine_scale: float = 16.0,
-        logit_adj_tau: float = 0.35,
+        logit_adj_tau: float = 0.0,
         beta_kl: float = 0.005,
         lambda_cls: float = 2.0,
         lambda_aug: float = 1.0,
         lambda_rect: float = 0.5,
-        lambda_uot: float = 0.5,
-        lambda_spa: float = 0.3,
+        lambda_uot: float = 0.4,
+        lambda_spa: float = 0.2,
+        open_set_keep_ratio: float = 0.65,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -438,8 +383,8 @@ class MaReVAE(nn.Module):
         self.latent_dim = latent_dim
         self.cosine_scale = cosine_scale
         self.logit_adj_tau = logit_adj_tau
+        self.open_set_keep_ratio = open_set_keep_ratio
 
-        # Hệ số các thành phần hàm loss
         self.beta_kl = beta_kl
         self.lambda_cls = lambda_cls
         self.lambda_aug = lambda_aug
@@ -447,62 +392,89 @@ class MaReVAE(nn.Module):
         self.lambda_uot = lambda_uot
         self.lambda_spa = lambda_spa
 
-        # 1. Encoder & Decoder
         self.encoder = VariationalEncoder(
             input_dim=input_dim,
             latent_dim=latent_dim,
             hidden_dims=hidden_dims,
         )
-        self.decoder = ZINBDecoder(
+        self.decoder = DomainAdaptiveDecoder(
             latent_dim=latent_dim,
             output_dim=input_dim,
             hidden_dims=(hidden_dims[1], hidden_dims[0]),
         )
 
-        # 2. Trọng số nguyên mẫu phân lớp trên mặt cầu đơn vị (Cosine Prototypes)
         self.prototypes = nn.Parameter(torch.randn(num_classes, latent_dim))
-        nn.init.xavier_uniform_(self.prototypes)
+        nn.init.orthogonal_(self.prototypes)
 
-        # Tiên nghiệm tần số lớp để điều chỉnh logit nhẹ và cung cấp prior cho UOT
+        # Trọng số cân bằng lớp nhẹ cho hàm Cross-Entropy trên scRNA-seq để lớp đa số
+        # (như ExE endoderm) không lấn át các lớp hiếm
         if class_counts is not None:
-            prior = class_counts.float().clamp(min=1.0)
-            prior = prior / prior.sum()
+            counts = class_counts.float().clamp(min=1.0)
+            cb_weights = (1.0 / counts).pow(0.25)
+            cb_weights = cb_weights / cb_weights.mean()
         else:
-            prior = torch.full((num_classes,), 1.0 / num_classes)
-        self.register_buffer("class_prior", prior)
-        self.register_buffer("log_class_prior", torch.log(prior + 1e-8))
+            cb_weights = torch.ones(num_classes)
+        self.register_buffer("ce_class_weights", cb_weights)
 
-        # 3. Bộ tăng cường Latent Mixup & Chỉnh lưu Đa tạp (không GMM, không k-NN)
+        # Tiên nghiệm đích trên miền Spatial được ước lượng động bằng EMA (khởi tạo ĐỒNG ĐỀU 1/C,
+        # tuyệt đối không dùng tỷ lệ lệch của scRNA-seq áp đặt lên ST!)
+        self.register_buffer("spa_ema_prior", torch.full((num_classes,), 1.0 / num_classes))
+
         self.mixup_rectifier = LatentMixupRectifier(
             num_classes=num_classes,
             latent_dim=latent_dim,
             class_counts=class_counts,
         )
 
-        # 4. Module Minibatch-UOT
-        self.uot = MinibatchUOT(reg_ent=0.08, reg_m_kl=0.5, num_iters=20)
+        self.uot = MinibatchUOT(reg_ent=0.06, reg_m_kl_row=0.5, reg_m_kl_col=1.5, num_iters=25)
 
     def compute_logits(self, z: torch.Tensor, apply_logit_adj: bool = False) -> torch.Tensor:
-        """Tính logit phân lớp dựa trên tương đồng Cosine giữa vector tiềm ẩn z và Prototypes."""
         z_norm = F.normalize(z, dim=-1)
         w_norm = F.normalize(self.prototypes, dim=-1)
-        logits = self.cosine_scale * torch.matmul(z_norm, w_norm.t())
-        if apply_logit_adj and self.logit_adj_tau > 0:
-            logits = logits + self.logit_adj_tau * self.log_class_prior.unsqueeze(0)
-        return logits
+        return self.cosine_scale * torch.matmul(z_norm, w_norm.t())
 
     @staticmethod
     def kl_divergence_normal(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Phân kỳ KL giữa q(z|x) = N(mu, sigma^2) và N(0, I)."""
         return -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
 
+    def prototype_anchor_loss(self, mu_rna: torch.Tensor, y_rna: torch.Tensor) -> torch.Tensor:
+        """
+        Khóa chặt mỗi vector nguyên mẫu self.prototypes[c] vào đúng tâm thực tế
+        của các tế bào thuộc lớp c trong không gian tiềm ẩn.
+        """
+        w_norm = F.normalize(self.prototypes, dim=-1)
+        loss = torch.tensor(0.0, device=mu_rna.device)
+        unique_classes = torch.unique(y_rna)
+        for c in unique_classes:
+            c_idx = int(c.item())
+            if c_idx < 0 or c_idx >= self.num_classes:
+                continue
+            mean_c = F.normalize(mu_rna[y_rna == c].mean(dim=0, keepdim=True), dim=-1).squeeze(0)
+            loss = loss + (1.0 - torch.sum(mean_c * w_norm[c_idx]))
+        return loss / max(1, len(unique_classes))
+
+    @staticmethod
+    def coral_alignment_loss(mu_rna: torch.Tensor, mu_spa: torch.Tensor) -> torch.Tensor:
+        """
+        Deep CORAL Loss: Căn chỉnh trung bình và ma trận hiệp phương sai giữa scRNA-seq và ST.
+        """
+        if mu_rna.shape[0] <= 2 or mu_spa.shape[0] <= 2:
+            return torch.tensor(0.0, device=mu_rna.device)
+        d = mu_rna.shape[1]
+        mean_r = mu_rna.mean(dim=0, keepdim=True)
+        mean_s = mu_spa.mean(dim=0, keepdim=True)
+        mean_loss = F.mse_loss(mean_r, mean_s)
+
+        cent_r = mu_rna - mean_r
+        cent_s = mu_spa - mean_s
+        cov_r = torch.matmul(cent_r.t(), cent_r) / (mu_rna.shape[0] - 1)
+        cov_s = torch.matmul(cent_s.t(), cent_s) / (mu_spa.shape[0] - 1)
+        cov_loss = torch.sum((cov_r - cov_s) ** 2) / (4.0 * d * d)
+        return mean_loss + cov_loss
+
     def spatial_smoothness_loss(
-        self, probs_spa: torch.Tensor, coords_spa: torch.Tensor, sigma_coord: float = 0.08
+        self, probs_spa: torch.Tensor, coords_spa: torch.Tensor, sigma_coord: float = 0.06
     ) -> torch.Tensor:
-        """
-        Khuyến khích các tế bào nằm gần nhau về mặt tọa độ vật lý có phân phối dự đoán tương đồng
-        thông qua hạt nhân Gaussian liên tục trên tọa độ (không cần dựng đồ thị k-NN rời rạc).
-        """
         if coords_spa.shape[0] <= 1 or torch.all(coords_spa == 0):
             return torch.tensor(0.0, device=probs_spa.device)
 
@@ -521,29 +493,27 @@ class MaReVAE(nn.Module):
         batch_spa: Optional[Dict[str, torch.Tensor]] = None,
         use_latent_mixup: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Thực hiện 1 bước huấn luyện tích hợp trên cặp mini-batch scRNA-seq và Spatial.
-        - Khi ở giai đoạn Warm-up: đặt `use_latent_mixup=False` để hình thành đa tạp gốc.
-        - Khi vào giai đoạn chính: đặt `use_latent_mixup=True` để kích hoạt Latent Mixup + Rectifier.
-        """
         x_rna = batch_rna["x"]
-        raw_rna = batch_rna["raw_counts"]
-        lib_rna = batch_rna["library_size"]
         y_rna = batch_rna["label"]
 
-        # 1. Nhánh scRNA-seq thực (Origin manifold)
+        # 1. Nhánh scRNA-seq tham chiếu
         z_rna, mu_rna, logvar_rna = self.encoder(x_rna, domain_id=0, freeze_stats=False)
-        rho_rna, pi_rna, theta = self.decoder(z_rna)
+        x_hat_rna = self.decoder(z_rna, domain_id=0, freeze_stats=False)
 
-        recon_loss_rna = zinb_negative_log_likelihood(raw_rna, lib_rna, rho_rna, pi_rna, theta)
+        recon_loss_rna = profile_reconstruction_loss(x_rna, x_hat_rna)
         kl_loss_rna = self.kl_divergence_normal(mu_rna, logvar_rna)
 
-        logits_rna = self.compute_logits(z_rna, apply_logit_adj=True)
-        cls_loss_real = F.cross_entropy(logits_rna, y_rna)
+        logits_rna = self.compute_logits(mu_rna)
+        cls_loss_real = F.cross_entropy(logits_rna, y_rna, weight=self.ce_class_weights)
+        anchor_loss = self.prototype_anchor_loss(mu_rna, y_rna)
 
-        total_loss = recon_loss_rna + self.beta_kl * kl_loss_rna + self.lambda_cls * cls_loss_real
+        total_loss = (
+            recon_loss_rna
+            + self.beta_kl * kl_loss_rna
+            + self.lambda_cls * (cls_loss_real + 0.5 * anchor_loss)
+        )
 
-        # 2. Nhánh Latent Mixup & Chỉnh lưu Đa tạp (nếu được kích hoạt)
+        # 2. Nhánh Latent Mixup & Chỉnh lưu Đa tạp
         aug_cls_loss = torch.tensor(0.0, device=x_rna.device)
         rect_loss = torch.tensor(0.0, device=x_rna.device)
 
@@ -560,62 +530,73 @@ class MaReVAE(nn.Module):
             trust_w = aug_out["trust_weights"]
             rect_loss = aug_out["rect_loss"]
 
-            logits_aug = self.compute_logits(z_aug, apply_logit_adj=False)
-            per_sample_ce = F.cross_entropy(logits_aug, y_aug, reduction="none")
+            logits_aug = self.compute_logits(z_aug)
+            per_sample_ce = F.cross_entropy(logits_aug, y_aug, weight=self.ce_class_weights, reduction="none")
             aug_cls_loss = torch.mean(trust_w * per_sample_ce)
 
             total_loss = total_loss + self.lambda_aug * aug_cls_loss + self.lambda_rect * rect_loss
         else:
-            # Trong pha warm-up vẫn cập nhật hàng đợi để sẵn sàng cho pha sau
             self.mixup_rectifier.update_queues(mu_rna, logvar_rna, y_rna)
 
-        # 3. Nhánh Spatial Transcriptomics & Căn chỉnh Minibatch-UOT
+        # 3. Nhánh Spatial Transcriptomics & Căn chỉnh Open-Set Safe UOT
         recon_loss_spa = torch.tensor(0.0, device=x_rna.device)
         uot_loss = torch.tensor(0.0, device=x_rna.device)
         spa_smooth_loss = torch.tensor(0.0, device=x_rna.device)
 
         if batch_spa is not None:
             x_spa = batch_spa["x"]
-            raw_spa = batch_spa["raw_counts"]
-            lib_spa = batch_spa["library_size"]
             coords_spa = batch_spa["coords"]
 
             z_spa, mu_spa, logvar_spa = self.encoder(x_spa, domain_id=1, freeze_stats=False)
-            rho_spa, pi_spa, theta_spa = self.decoder(z_spa)
+            x_hat_spa = self.decoder(z_spa, domain_id=1, freeze_stats=False)
 
-            recon_loss_spa = zinb_negative_log_likelihood(raw_spa, lib_spa, rho_spa, pi_spa, theta_spa)
+            recon_loss_spa = profile_reconstruction_loss(x_spa, x_hat_spa)
             kl_loss_spa = self.kl_divergence_normal(mu_spa, logvar_spa)
+            coral_loss = self.coral_alignment_loss(mu_rna, mu_spa)
 
-            # Tính khoảng cách Cosine từ điểm không gian tới các nguyên mẫu lớp
-            z_spa_norm = F.normalize(mu_spa, dim=-1)
-            w_norm = F.normalize(self.prototypes, dim=-1)
-            cos_sim_spa = torch.matmul(z_spa_norm, w_norm.t())
-            cost_matrix = 1.0 - cos_sim_spa  # (B_sp, C) trong [0, 2]
+            total_loss = total_loss + recon_loss_spa + self.beta_kl * kl_loss_spa + 0.5 * coral_loss
 
-            # Kế hoạch vận chuyển tối ưu không cân bằng (UOT) với tiên nghiệm lớp đã làm mượt
-            tempered_prior = self.class_prior.pow(0.5)
-            transport_plan = self.uot.compute_transport_plan(cost_matrix.detach(), class_prior=tempered_prior)
-            pseudo_probs = transport_plan / (transport_plan.sum(dim=1, keepdim=True) + 1e-8)
+            # Chỉ kích hoạt UOT pseudo-label alignment sau giai đoạn Warm-up (khi use_latent_mixup=True)
+            # để tránh việc ghép nhầm vào các nguyên mẫu chưa hội tụ ở những epoch đầu
+            if use_latent_mixup:
+                z_spa_norm = F.normalize(mu_spa, dim=-1)
+                w_norm = F.normalize(self.prototypes.detach(), dim=-1)
+                cos_sim_spa = torch.matmul(z_spa_norm, w_norm.t())
+                cost_matrix = 1.0 - cos_sim_spa  # (B_sp, C)
 
-            # Trọng số tin cậy của kế hoạch vận chuyển cho từng tế bào không gian
-            cell_mass = transport_plan.sum(dim=1)
-            mass_weights = torch.clamp(cell_mass * cost_matrix.shape[0], min=0.1, max=2.0).detach()
+                # Chỉ lấy các tế bào ST có độ tương đồng Cosine cao (Known candidates) để cập nhật prior & UOT
+                max_cos, _ = cos_sim_spa.detach().max(dim=-1)
+                cos_cutoff = torch.quantile(max_cos, q=1.0 - self.open_set_keep_ratio)
+                known_cand_mask = (max_cos >= cos_cutoff).float()
 
-            logits_spa = self.compute_logits(mu_spa, apply_logit_adj=False)
-            log_probs_spa = F.log_softmax(logits_spa, dim=-1)
-            uot_ce = -torch.sum(pseudo_probs * log_probs_spa, dim=-1)
-            uot_loss = torch.mean(mass_weights * uot_ce)
+                transport_plan = self.uot.compute_transport_plan(
+                    cost_matrix.detach(), target_prior=self.spa_ema_prior
+                )
+                pseudo_probs = transport_plan / (transport_plan.sum(dim=1, keepdim=True) + 1e-8)
 
-            probs_spa = F.softmax(logits_spa, dim=-1)
-            spa_smooth_loss = self.spatial_smoothness_loss(probs_spa, coords_spa)
+                # Cập nhật EMA prior trên miền ST nhưng giữ 30% hỗn hợp đồng đều để không bao giờ sụp đổ về 1 lớp
+                with torch.no_grad():
+                    batch_est_prior = (pseudo_probs * known_cand_mask.unsqueeze(1)).sum(dim=0)
+                    batch_est_prior = batch_est_prior / (batch_est_prior.sum() + 1e-8)
+                    uniform_p = torch.full_like(batch_est_prior, 1.0 / self.num_classes)
+                    blended_p = 0.7 * batch_est_prior + 0.3 * uniform_p
+                    self.spa_ema_prior.mul_(0.95).add_(0.05 * blended_p)
 
-            total_loss = (
-                total_loss
-                + recon_loss_spa
-                + self.beta_kl * kl_loss_spa
-                + self.lambda_uot * uot_loss
-                + self.lambda_spa * spa_smooth_loss
-            )
+                logits_spa = self.compute_logits(mu_spa)
+                log_probs_spa = F.log_softmax(logits_spa, dim=-1)
+                uot_ce = -torch.sum(pseudo_probs.detach() * log_probs_spa, dim=-1)
+
+                # Chỉ kéo các tế bào Known candidate về phía Prototype, giữ nguyên các tế bào Unknown ở vùng đệm
+                uot_loss = torch.sum(known_cand_mask * uot_ce) / (known_cand_mask.sum() + 1e-6)
+
+                probs_spa = F.softmax(logits_spa, dim=-1)
+                spa_smooth_loss = self.spatial_smoothness_loss(probs_spa, coords_spa)
+
+                total_loss = (
+                    total_loss
+                    + self.lambda_uot * uot_loss
+                    + self.lambda_spa * spa_smooth_loss
+                )
 
         return {
             "loss": total_loss,
@@ -634,14 +615,13 @@ class MaReVAE(nn.Module):
         dataloader,
         domain_id: int = 1,
         detect_unknown: bool = False,
-        unknown_quantile: float = 0.25,
+        unknown_quantile: float = 0.35,
         device: Optional[torch.device] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Dự đoán nhãn, xác suất phân lớp, vector tiềm ẩn và điểm năng lượng (cho bài toán Open-set)
-        trên toàn bộ một DataLoader.
-        - Nếu `detect_unknown=True` (dùng cho tập seqFISH có lớp Unknown): các tế bào có độ tin cậy
-          năng lượng tự do + khối lượng UOT thấp dưới ngưỡng sẽ được gán nhãn `-1` (Unknown).
+        Dự đoán nhãn trên toàn bộ DataLoader.
+        Lưu ý: Đối với dữ liệu Spatial (domain_id=1), cập nhật thống kê BatchNorm toàn cục
+        trước khi suy luận để loại bỏ hoàn toàn độ lệch giữa mini-batch và toàn tập.
         """
         self.eval()
         if device is None:
@@ -654,25 +634,24 @@ class MaReVAE(nn.Module):
         all_scores = []
 
         w_norm = F.normalize(self.prototypes, dim=-1)
-        tempered_prior = self.class_prior.pow(0.5)
 
         for batch in dataloader:
             x = batch["x"].to(device)
             labels = batch["label"]
             _, mu, _ = self.encoder(x, domain_id=domain_id, freeze_stats=True)
 
-            logits = self.compute_logits(mu, apply_logit_adj=False)
+            logits = self.compute_logits(mu)
             probs = F.softmax(logits, dim=-1)
 
-            # Điểm tin cậy kết hợp giữa Free Energy, Max Softmax và Khối lượng vận chuyển UOT
+            # Điểm tin cậy kết hợp giữa: (1) Tương đồng Cosine cực đại với Prototype,
+            # (2) Xác suất Softmax cực đại, và (3) Âm Entropy phân lớp
+            z_norm = F.normalize(mu, dim=-1)
+            cos_sim = torch.matmul(z_norm, w_norm.t())
+            max_cos, _ = cos_sim.max(dim=-1)
             max_prob, _ = probs.max(dim=-1)
-            free_energy_conf = torch.logsumexp(logits, dim=-1) / self.cosine_scale
 
-            cost_matrix = 1.0 - torch.matmul(F.normalize(mu, dim=-1), w_norm.t())
-            T_plan = self.uot.compute_transport_plan(cost_matrix, class_prior=tempered_prior)
-            uot_mass = T_plan.sum(dim=-1) * cost_matrix.shape[0]
-
-            known_score = 0.4 * max_prob + 0.4 * free_energy_conf + 0.2 * uot_mass
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1) / math.log(self.num_classes)
+            known_score = 0.50 * max_cos + 0.30 * max_prob + 0.20 * (1.0 - entropy)
 
             all_mu.append(mu.cpu())
             all_logits.append(logits.cpu())
